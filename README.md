@@ -6,6 +6,10 @@ An interactive dashboard that answers one question:
 
 It combines ~500 tide gauges worldwide with the satellite record of global mean sea level and NOAA's 2022 sea-level-rise scenarios. Data is fetched live from public APIs every time the cache expires, so the numbers stay current without any manual updates.
 
+**[▶ Open the live app](https://sea-level-analysis.streamlit.app/)** (it may take a moment to wake up if nobody has visited recently).
+
+![Dashboard showing global and station sea-level trends, a world map of tide gauges and details for Virginia Key, Miami](docs/screenshot.png)
+
 ## What you can do
 
 - **Explore the map.** Every tide gauge is coloured by its long-term trend (red = rising, blue = falling). Click a station, or search by name (try *Miami*, *Reykjavik* or *Tokyo*).
