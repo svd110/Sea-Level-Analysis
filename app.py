@@ -8,7 +8,7 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -16,7 +16,7 @@ import streamlit as st
 
 from slr import charts, sources
 from slr import transform as T
-from slr.theme import get_theme
+from slr.theme import Theme, get_theme
 
 st.set_page_config(page_title="Global Sea Level Analytics", page_icon="🌊", layout="wide")
 
@@ -67,12 +67,68 @@ def load_live(station_id: str) -> tuple[dict | None, T.Extreme | None, datetime]
     return latest, extreme, datetime.now(timezone.utc)
 
 
-# --- Styling -----------------------------------------------------------------
+# --- Selected station --------------------------------------------------------
 
-ctx_theme = getattr(st.context, "theme", None)
-theme = get_theme(getattr(ctx_theme, "type", None))
+@dataclass
+class StationView:
+    """Everything the page shows about the selected station."""
+    sid: str
+    station: pd.Series
+    monthly: pd.DataFrame
+    annual: pd.DataFrame
+    offset_m: float
+    baseline_label: str
+    anomaly: T.Anomaly | None
+    proj: pd.DataFrame
+    proj_match: str
+    extrap: pd.DataFrame | None
+    latest: dict | None
+    extreme: T.Extreme | None
 
-st.markdown(f"""
+    @property
+    def is_us(self) -> bool:
+        return self.station["affil"] == "US"
+
+    @property
+    def has_monthly(self) -> bool:
+        return bool(self.monthly["msl_m"].notna().any())
+
+    @property
+    def has_proj(self) -> bool:
+        return len(self.proj) > 0
+
+
+def load_station(sid: str, station: pd.Series) -> StationView:
+    is_us = station["affil"] == "US"
+    try:
+        monthly = load_monthly(sid)
+    except sources.SourceError:
+        monthly = T.parse_monthly([])
+    if monthly["msl_m"].notna().any():
+        offset_m, baseline_label = T.baseline_offset(monthly)
+        annual = T.annual_means(monthly)
+        anomaly = T.current_anomaly(monthly)
+    else:
+        offset_m, baseline_label, annual, anomaly = 0.0, "", pd.DataFrame(), None
+
+    proj, proj_match = (load_projections(sid, float(station["lat"]), float(station["lon"]))
+                        if is_us else (pd.DataFrame(), ""))
+
+    extrap = None
+    if not len(proj) and len(annual):
+        start_year, start_cm = T.trend_anchor(annual, offset_m, station["trend_mm_yr"])
+        extrap = T.extrapolate(station["trend_mm_yr"], station["trend_ci_mm_yr"],
+                               start_year, start_cm)
+
+    latest, extreme, _ = load_live(sid) if is_us else (None, None, None)
+    return StationView(sid, station, monthly, annual, offset_m, baseline_label, anomaly,
+                       proj, proj_match, extrap, latest, extreme)
+
+
+# --- Page helpers ------------------------------------------------------------
+
+def inject_styles(theme: Theme) -> None:
+    st.markdown(f"""
 <style>
 /* Clear Streamlit's fixed toolbar (3.75rem) so the title isn't clipped. */
 .block-container {{ padding-top: 4.75rem; max-width: 1400px; }}
@@ -107,28 +163,11 @@ def plot(fig, **kwargs):
                            config={"displaylogo": False}, **kwargs)
 
 
-# --- Data --------------------------------------------------------------------
-
-try:
-    stations_all, network_meta = load_network()
-except sources.SourceError:
-    st.error("Station trends are unavailable: NOAA did not respond and no snapshot is bundled. "
-             "Try again in a few minutes.")
-    st.stop()
-
-try:
-    gmsl, gmsl_meta = load_gmsl()
-except sources.SourceError:
-    gmsl, gmsl_meta = None, None
-
-all_meta = network_meta + ([gmsl_meta] if gmsl_meta else [])
-is_live = gmsl_meta is not None and all(m.source == "live" for m in all_meta)
-updated = min(m.fetched_at for m in all_meta)
-
 # --- Header ------------------------------------------------------------------
 
-status_color, status_label = (theme.good, "LIVE") if is_live else (theme.warning, "SNAPSHOT")
-st.markdown(f"""
+def render_header(theme: Theme, updated: datetime, is_live: bool) -> None:
+    status_color, status_label = (theme.good, "LIVE") if is_live else (theme.warning, "SNAPSHOT")
+    st.markdown(f"""
 <div class="slr-header">
   <div>
     <h1>🌊 Global Sea Level Analytics</h1>
@@ -142,15 +181,12 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
-if not is_live:
-    st.warning("Some data sources could not be reached, so part of the dashboard is showing "
-               "the bundled snapshot. The status returns to LIVE once they respond.", icon="⚠️")
+    if not is_live:
+        st.warning("Some data sources could not be reached, so part of the dashboard is showing "
+                   "the bundled snapshot. The status returns to LIVE once they respond.", icon="⚠️")
 
-# --- Selection state ---------------------------------------------------------
 
-if "station_id" not in st.session_state:
-    st.session_state.station_id = DEFAULT_STATION
-
+# --- Selection state and controls --------------------------------------------
 
 def _map_pick() -> str | None:
     """Station id from the latest map click, if the click is new."""
@@ -166,110 +202,87 @@ def _map_pick() -> str | None:
     return sid
 
 
-picked = _map_pick()
-if picked:
-    st.session_state.station_id = picked
-    st.session_state.station_pick = picked
-
-
 def _on_search():
     st.session_state.station_id = st.session_state.station_pick
 
 
-# --- Controls (one row, above the content they filter) -----------------------
+def apply_map_pick() -> None:
+    if "station_id" not in st.session_state:
+        st.session_state.station_id = DEFAULT_STATION
+    picked = _map_pick()
+    if picked:
+        st.session_state.station_id = picked
+        st.session_state.station_pick = picked
 
-c1, c2, c3 = st.columns([3, 2, 1], vertical_alignment="bottom")
-names = dict(zip(stations_all["station_id"], stations_all["name"]))
-if st.session_state.station_id not in names:
-    st.session_state.station_id = DEFAULT_STATION
-st.session_state.setdefault("station_pick", st.session_state.station_id)
-c1.selectbox("Find a station", options=list(names), format_func=names.get,
-             key="station_pick", on_change=_on_search,
-             help="Type to search, or click a station on the map.")
-dataset = c2.selectbox("Stations shown", list(DATASETS))
-if c3.button("Refresh data", help="Fetch fresh data now instead of waiting for the hourly refresh"):
-    st.cache_data.clear()
-    st.rerun()
 
-affil = DATASETS[dataset]
-stations = stations_all if affil is None else stations_all[stations_all["affil"] == affil]
-stations = stations.reset_index(drop=True)
-station = stations_all.set_index("station_id").loc[st.session_state.station_id]
-sid = st.session_state.station_id
-is_us = station["affil"] == "US"
+def render_controls(stations_all: pd.DataFrame) -> str:
+    """Station search, dataset filter and refresh button (one row, above the content they
+    filter). Returns the chosen dataset label."""
+    c1, c2, c3 = st.columns([3, 2, 1], vertical_alignment="bottom")
+    names = dict(zip(stations_all["station_id"], stations_all["name"]))
+    if st.session_state.station_id not in names:
+        st.session_state.station_id = DEFAULT_STATION
+    st.session_state.setdefault("station_pick", st.session_state.station_id)
+    c1.selectbox("Find a station", options=list(names), format_func=names.get,
+                 key="station_pick", on_change=_on_search,
+                 help="Type to search, or click a station on the map.")
+    dataset = c2.selectbox("Stations shown", list(DATASETS))
+    if c3.button("Refresh data", help="Fetch fresh data now instead of waiting for the hourly refresh"):
+        st.cache_data.clear()
+        st.rerun()
+    return dataset
 
-# --- Station data ------------------------------------------------------------
-
-try:
-    monthly = load_monthly(sid)
-except sources.SourceError:
-    monthly = T.parse_monthly([])
-has_monthly = monthly["msl_m"].notna().any()
-if has_monthly:
-    offset_m, baseline_label = T.baseline_offset(monthly)
-    annual = T.annual_means(monthly)
-    anomaly = T.current_anomaly(monthly)
-else:
-    offset_m, baseline_label, annual, anomaly = 0.0, "", pd.DataFrame(), None
-
-proj, proj_match = (load_projections(sid, float(station["lat"]), float(station["lon"]))
-                    if is_us else (pd.DataFrame(), ""))
-has_proj = len(proj) > 0
-
-extrap = None
-if not has_proj and has_monthly and len(annual):
-    start_year, start_cm = T.trend_anchor(annual, offset_m, station["trend_mm_yr"])
-    extrap = T.extrapolate(station["trend_mm_yr"], station["trend_ci_mm_yr"], start_year, start_cm)
-
-latest, extreme, live_at = load_live(sid) if is_us else (None, None, None)
 
 # --- KPI row -----------------------------------------------------------------
 
-k1, k2, k3, k4 = st.columns(4)
-if gmsl is not None:
-    gt = T.global_trend(gmsl)
-    metric(
-        k1, "Global trend (satellites)", f"{gt.rate_mm_yr:+.1f} mm/yr",
-        f"{gt.recent_rate_mm_yr:+.1f} mm/yr over the last decade",
-        chart_data=gmsl.groupby(gmsl["year"].astype(int))["gmsl_mm"].mean().round(1).tolist(),
-        chart_type="area",
-        help=(f"Global mean sea level from satellite altimetry, {gt.start_year + 1}–"
-              f"{gt.end_date:%Y}. The rise is accelerating by about "
-              f"{gt.acceleration_mm_yr2:.2f} mm/yr each year. Source: {gmsl_meta.origin}."),
-    )
-else:
-    metric(k1, "Global trend (satellites)", "—", help="Satellite record unavailable.")
+def render_kpis(view: StationView, gmsl: pd.DataFrame | None,
+                gmsl_meta: sources.Fetched | None) -> None:
+    station = view.station
+    k1, k2, k3, k4 = st.columns(4)
+    if gmsl is not None:
+        gt = T.global_trend(gmsl)
+        metric(
+            k1, "Global trend (satellites)", f"{gt.rate_mm_yr:+.1f} mm/yr",
+            f"{gt.recent_rate_mm_yr:+.1f} mm/yr over the last decade",
+            chart_data=gmsl.groupby(gmsl["year"].astype(int))["gmsl_mm"].mean().round(1).tolist(),
+            chart_type="area",
+            help=(f"Global mean sea level from satellite altimetry, {gt.start_year + 1}–"
+                  f"{gt.end_date:%Y}. The rise is accelerating by about "
+                  f"{gt.acceleration_mm_yr2:.2f} mm/yr each year. Source: {gmsl_meta.origin}."),
+        )
+    else:
+        metric(k1, "Global trend (satellites)", "—", help="Satellite record unavailable.")
 
-metric(
-    k2, "Selected station trend", f"{station['trend_mm_yr']:+.2f} mm/yr",
-    f"± {station['trend_ci_mm_yr']:.2f} mm/yr (95% confidence)",
-    help=("Long-term relative sea-level trend: includes both ocean rise and vertical "
-          "land motion (sinking land adds to it, rising land subtracts)."),
-)
-arrow = {"Rising": "↑", "Falling": "↓"}.get(station["direction"], "→")
-metric(
-    k3, "Trend direction", f"{arrow} {station['direction']}", station["name"],
-    help="Rising/falling only when the 95% confidence interval excludes zero.",
-)
-if has_proj:
-    lo, mid, hi = T.scenario_range(proj, 2050)
-    metric(k4, "Projection 2050 (Intermediate)", f"{mid:+.0f} cm",
-           f"Low–High range: {lo:+.0f} to {hi:+.0f} cm",
-           help="NOAA 2022 Interagency scenarios, relative to the 2000 baseline "
-                "(1991–2009 average).")
-elif extrap is not None:
-    v = T.value_at(extrap, 2050)
-    metric(k4, "2050 if the trend continues", f"{v:+.0f} cm", "Linear extrapolation only",
-           help=f"Straight-line continuation of the observed trend, vs the {baseline_label}. "
-                "NOAA scenarios cover US stations only; this ignores acceleration and "
-                "likely understates future rise.")
-else:
-    metric(k4, "Projection 2050", "—", help="No projection available.")
+    metric(
+        k2, "Selected station trend", f"{station['trend_mm_yr']:+.2f} mm/yr",
+        f"± {station['trend_ci_mm_yr']:.2f} mm/yr (95% confidence)",
+        help=("Long-term relative sea-level trend: includes both ocean rise and vertical "
+              "land motion (sinking land adds to it, rising land subtracts)."),
+    )
+    arrow = {"Rising": "↑", "Falling": "↓"}.get(station["direction"], "→")
+    metric(
+        k3, "Trend direction", f"{arrow} {station['direction']}", station["name"],
+        help="Rising/falling only when the 95% confidence interval excludes zero.",
+    )
+    if view.has_proj:
+        lo, mid, hi = T.scenario_range(view.proj, 2050)
+        metric(k4, "Projection 2050 (Intermediate)", f"{mid:+.0f} cm",
+               f"Low–High range: {lo:+.0f} to {hi:+.0f} cm",
+               help="NOAA 2022 Interagency scenarios, relative to the 2000 baseline "
+                    "(1991–2009 average).")
+    elif view.extrap is not None:
+        v = T.value_at(view.extrap, 2050)
+        metric(k4, "2050 if the trend continues", f"{v:+.0f} cm", "Linear extrapolation only",
+               help=f"Straight-line continuation of the observed trend, vs the {view.baseline_label}. "
+                    "NOAA scenarios cover US stations only; this ignores acceleration and "
+                    "likely understates future rise.")
+    else:
+        metric(k4, "Projection 2050", "—", help="No projection available.")
+
 
 # --- Map + station panel -----------------------------------------------------
 
-map_col, panel_col = st.columns([2.2, 1], gap="large")
-with map_col:
+def render_map(stations: pd.DataFrame, theme: Theme, sid: str) -> None:
     st.markdown("##### Station trends")
     st.caption("Each dot is a tide gauge coloured by its long-term trend: red = sea level rising "
                "relative to the land, blue = falling (usually because the land is rising). "
@@ -277,7 +290,9 @@ with map_col:
     plot(charts.station_map(stations, theme, sid), key="station_map",
          on_select="rerun", selection_mode="points")
 
-with panel_col:
+
+def render_station_panel(view: StationView) -> None:
+    station, anomaly, latest, extreme = view.station, view.anomaly, view.latest, view.extreme
     st.markdown(f'<p class="slr-station-name">{station["name"]}</p>', unsafe_allow_html=True)
     facts = [
         ("Current trend", f"{station['trend_mm_yr']:+.2f} ± {station['trend_ci_mm_yr']:.2f} mm/yr"),
@@ -293,7 +308,7 @@ with panel_col:
         facts.append(("Highest, last 12 months", f"{extreme.value_m:+.2f} m vs MSL ({extreme.month})"))
     facts.append(("Ocean basin", station["basin"]))
     facts.append(("Coastal region", station["coastal_region"]))
-    facts.append(("Network", "NOAA CO-OPS" if is_us else "PSMSL (via NOAA)"))
+    facts.append(("Network", "NOAA CO-OPS" if view.is_us else "PSMSL (via NOAA)"))
     st.markdown('<dl class="slr-facts">' + "".join(
         f"<dt>{k}</dt><dd>{v}</dd>" for k, v in facts) + "</dl>", unsafe_allow_html=True)
     if anomaly:
@@ -302,104 +317,113 @@ with panel_col:
         st.caption(f"⚠️ NOAA flags this record: {station['events']}. The trend may be affected.")
 
     st.markdown("**Projected rise**")
-    if has_proj:
+    if view.has_proj:
         rows = [{"Year": str(y), "Intermediate": f"{mid:+.0f} cm",
                  "Low – High": f"{lo:+.0f} to {hi:+.0f} cm"}
-                for y in T.KEY_YEARS for lo, mid, hi in [T.scenario_range(proj, y)]]
+                for y in T.KEY_YEARS for lo, mid, hi in [T.scenario_range(view.proj, y)]]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        st.caption(f"NOAA 2022 scenarios ({proj_match}), relative to the 2000 baseline.")
-    elif extrap is not None:
+        st.caption(f"NOAA 2022 scenarios ({view.proj_match}), relative to the 2000 baseline.")
+    elif view.extrap is not None:
         rows = [{"Year": str(y), "Trend continued": f"{v:+.0f} cm"}
-                for y in T.KEY_YEARS if (v := T.value_at(extrap, y)) is not None]
+                for y in T.KEY_YEARS if (v := T.value_at(view.extrap, y)) is not None]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption("Linear extrapolation of the observed trend, vs the "
-                   f"{baseline_label}. Not a climate projection.")
+                   f"{view.baseline_label}. Not a climate projection.")
     else:
         st.caption("No projection available for this station.")
 
+
 # --- Station charts ----------------------------------------------------------
 
-h_col, p_col = st.columns(2, gap="large")
-with h_col:
-    st.markdown(f"##### Historical sea level · {station['place']}")
-    if has_monthly:
-        plot(charts.station_history(monthly, annual, offset_m, theme, baseline_label))
+def render_history(view: StationView, theme: Theme) -> None:
+    st.markdown(f"##### Historical sea level · {view.station['place']}")
+    if view.has_monthly:
+        plot(charts.station_history(view.monthly, view.annual, view.offset_m, theme,
+                                    view.baseline_label))
         st.caption("Relative sea level measured by the tide gauge. The dashed line is NOAA's "
                    "fitted linear trend.")
     else:
         st.info("Monthly data for this station could not be loaded right now.")
 
-with p_col:
+
+def render_outlook(view: StationView, theme: Theme) -> None:
+    has_proj = view.has_proj
     head, toggle = st.columns([3, 2], vertical_alignment="bottom")
     head.markdown("##### Looking ahead" if has_proj else "##### If the trend continues")
     # Scenarios exist only for US stations; elsewhere there is nothing to toggle.
     show_all = has_proj and toggle.toggle(
         "Show all 5 scenarios", value=False,
         help="NOAA publishes five scenarios; the default view shows Low, Intermediate and High.")
-    observed = T.observed_annual(annual, offset_m) if has_monthly and len(annual) else None
-    y_title = "cm vs 2000 baseline" if has_proj else f"cm vs {baseline_label}"
-    if has_proj or extrap is not None:
-        plot(charts.station_projection(proj if has_proj else None, extrap, observed,
+    observed = (T.observed_annual(view.annual, view.offset_m)
+                if view.has_monthly and len(view.annual) else None)
+    y_title = "cm vs 2000 baseline" if has_proj else f"cm vs {view.baseline_label}"
+    if has_proj or view.extrap is not None:
+        plot(charts.station_projection(view.proj if has_proj else None, view.extrap, observed,
                                        theme, show_all, y_title))
     if has_proj:
         st.caption("Scenarios range from Low (today's rate roughly continues) to High "
                    "(rapid ice-sheet loss). Blue dots are observations on a comparable "
                    "baseline, so you can see which path the station is tracking.")
-    elif extrap is not None:
+    elif view.extrap is not None:
         st.caption("NOAA's scenarios cover US stations only. This straight-line continuation "
                    "ignores the acceleration seen globally, so treat it as a lower-end "
                    "reference, not a forecast.")
     else:
         st.info("Not enough data to extend the trend for this station.")
 
+
 # --- Global context ----------------------------------------------------------
 
-st.divider()
-# Headings share a row so both charts start at the same height, whatever the toggle adds.
-g_head, r_head = st.columns(2, gap="large", vertical_alignment="center")
-g_head.markdown("##### Global sea level over time")
-with r_head:
-    h_col, t_col = st.columns([3, 2], vertical_alignment="center")
-    grouping = t_col.segmented_control("Group regions by", list(GROUPINGS), default="Ocean basin",
-                                       label_visibility="collapsed") or "Ocean basin"
-    h_col.markdown(f"##### Trend by {grouping.lower()}")
+def render_global(stations: pd.DataFrame, gmsl: pd.DataFrame | None,
+                  gmsl_meta: sources.Fetched | None, theme: Theme) -> None:
+    st.divider()
+    # Headings share a row so both charts start at the same height, whatever the toggle adds.
+    g_head, r_head = st.columns(2, gap="large", vertical_alignment="center")
+    g_head.markdown("##### Global sea level over time")
+    with r_head:
+        h_col, t_col = st.columns([3, 2], vertical_alignment="center")
+        grouping = t_col.segmented_control("Group regions by", list(GROUPINGS), default="Ocean basin",
+                                           label_visibility="collapsed") or "Ocean basin"
+        h_col.markdown(f"##### Trend by {grouping.lower()}")
 
-g_col, r_col = st.columns(2, gap="large")
-with g_col:
-    if gmsl is not None:
-        plot(charts.gmsl_chart(gmsl, theme))
-        st.caption(f"Global mean sea level from satellite altimetry ({gmsl_meta.origin}), "
-                   "seasonal cycle removed. The upward curve of the fit shows the rise "
-                   "is speeding up.")
-    else:
-        st.info("The satellite record could not be loaded right now.")
+    g_col, r_col = st.columns(2, gap="large")
+    with g_col:
+        if gmsl is not None:
+            plot(charts.gmsl_chart(gmsl, theme))
+            st.caption(f"Global mean sea level from satellite altimetry ({gmsl_meta.origin}), "
+                       "seasonal cycle removed. The upward curve of the fit shows the rise "
+                       "is speeding up.")
+        else:
+            st.info("The satellite record could not be loaded right now.")
 
-with r_col:
-    summary = T.region_summary(stations, GROUPINGS[grouping])
-    plot(charts.region_bars(summary, theme))
-    st.caption("Bars show the median station trend; whiskers show the middle half of "
-               "stations. Regions where the land is still rebounding from Ice Age glaciers "
-               "(the Baltic, Alaska, the Arctic) show falling relative sea level.")
-
-ns = T.network_stats(stations)
-s1, s2, s3, s4 = st.columns(4)  # height="stretch" keeps the cards level
-
-
-def share(n: int) -> str | None:
-    return f"{n / ns.stations:.0%} of stations" if ns.stations else None
+    with r_col:
+        summary = T.region_summary(stations, GROUPINGS[grouping])
+        plot(charts.region_bars(summary, theme))
+        st.caption("Bars show the median station trend; whiskers show the middle half of "
+                   "stations. Regions where the land is still rebounding from Ice Age glaciers "
+                   "(the Baltic, Alaska, the Arctic) show falling relative sea level.")
 
 
-metric(s1, "Monitored stations", f"{ns.stations}", height="stretch",
-       help=f"Tide gauges with a long-term NOAA trend ({dataset.lower()}).")
-metric(s2, "↑ Significantly rising", f"{ns.rising}", share(ns.rising), height="stretch")
-metric(s3, "↓ Significantly falling", f"{ns.falling}", share(ns.falling), height="stretch")
-metric(s4, "Median station trend", f"{ns.median_trend:+.2f} mm/yr", height="stretch",
-       help="Relative trends at gauges, so it differs from the satellite global mean.")
+def render_network_stats(stations: pd.DataFrame, dataset: str) -> None:
+    ns = T.network_stats(stations)
+
+    def share(n: int) -> str | None:
+        return f"{n / ns.stations:.0%} of stations" if ns.stations else None
+
+    s1, s2, s3, s4 = st.columns(4)  # height="stretch" keeps the cards level
+    metric(s1, "Monitored stations", f"{ns.stations}", height="stretch",
+           help=f"Tide gauges with a long-term NOAA trend ({dataset.lower()}).")
+    metric(s2, "↑ Significantly rising", f"{ns.rising}", share(ns.rising), height="stretch")
+    metric(s3, "↓ Significantly falling", f"{ns.falling}", share(ns.falling), height="stretch")
+    metric(s4, "Median station trend", f"{ns.median_trend:+.2f} mm/yr", height="stretch",
+           help="Relative trends at gauges, so it differs from the satellite global mean.")
+
 
 # --- Methods and data --------------------------------------------------------
 
-with st.expander("Methodology and data sources"):
-    st.markdown(f"""
+def render_methodology(gmsl_meta: sources.Fetched | None) -> None:
+    with st.expander("Methodology and data sources"):
+        st.markdown(f"""
 **Station trends.** NOAA CO-OPS [Sea Level Trends](https://tidesandcurrents.noaa.gov/sltrends/)
 product: linear trends fitted to monthly mean sea level after removing the seasonal cycle, with
 95% confidence intervals that account for serial correlation. International stations come from
@@ -428,24 +452,80 @@ for six minutes. If a source is unreachable the dashboard falls back to a bundle
 the status shows SNAPSHOT.
 """)
 
-with st.expander("Station data table"):
-    table = stations[["name", "trend_mm_yr", "trend_ci_mm_yr", "direction", "start_year",
-                      "end_year", "basin", "coastal_region", "lat", "lon"]]
-    st.dataframe(table, hide_index=True, width="stretch", column_config={
-        "name": "Station",
-        "trend_mm_yr": st.column_config.NumberColumn("Trend (mm/yr)", format="%+.2f"),
-        "trend_ci_mm_yr": st.column_config.NumberColumn("± 95% CI", format="%.2f"),
-        "direction": "Direction",
-        "start_year": st.column_config.NumberColumn("From", format="%d"),
-        "end_year": st.column_config.NumberColumn("To", format="%d"),
-        "basin": "Ocean basin",
-        "coastal_region": "Coastal region",
-        "lat": st.column_config.NumberColumn("Lat", format="%.2f"),
-        "lon": st.column_config.NumberColumn("Lon", format="%.2f"),
-    })
-    st.download_button("Download CSV", table.to_csv(index=False), "sea_level_trends.csv",
-                       "text/csv")
 
-st.caption("Data: NOAA CO-OPS, PSMSL, CU Boulder Sea Level Research Group, NOAA Laboratory for "
-           "Satellite Altimetry. Altimetry data are provided by NOAA Laboratory for Satellite "
-           "Altimetry.")
+def render_station_table(stations: pd.DataFrame) -> None:
+    with st.expander("Station data table"):
+        table = stations[["name", "trend_mm_yr", "trend_ci_mm_yr", "direction", "start_year",
+                          "end_year", "basin", "coastal_region", "lat", "lon"]]
+        st.dataframe(table, hide_index=True, width="stretch", column_config={
+            "name": "Station",
+            "trend_mm_yr": st.column_config.NumberColumn("Trend (mm/yr)", format="%+.2f"),
+            "trend_ci_mm_yr": st.column_config.NumberColumn("± 95% CI", format="%.2f"),
+            "direction": "Direction",
+            "start_year": st.column_config.NumberColumn("From", format="%d"),
+            "end_year": st.column_config.NumberColumn("To", format="%d"),
+            "basin": "Ocean basin",
+            "coastal_region": "Coastal region",
+            "lat": st.column_config.NumberColumn("Lat", format="%.2f"),
+            "lon": st.column_config.NumberColumn("Lon", format="%.2f"),
+        })
+        st.download_button("Download CSV", table.to_csv(index=False), "sea_level_trends.csv",
+                           "text/csv")
+
+
+# --- Page --------------------------------------------------------------------
+
+def main() -> None:
+    ctx_theme = getattr(st.context, "theme", None)
+    theme = get_theme(getattr(ctx_theme, "type", None))
+    inject_styles(theme)
+
+    try:
+        stations_all, network_meta = load_network()
+    except sources.SourceError:
+        st.error("Station trends are unavailable: NOAA did not respond and no snapshot is bundled. "
+                 "Try again in a few minutes.")
+        st.stop()
+
+    try:
+        gmsl, gmsl_meta = load_gmsl()
+    except sources.SourceError:
+        gmsl, gmsl_meta = None, None
+
+    all_meta = network_meta + ([gmsl_meta] if gmsl_meta else [])
+    is_live = gmsl_meta is not None and all(m.source == "live" for m in all_meta)
+    render_header(theme, min(m.fetched_at for m in all_meta), is_live)
+
+    apply_map_pick()
+    dataset = render_controls(stations_all)
+    affil = DATASETS[dataset]
+    stations = stations_all if affil is None else stations_all[stations_all["affil"] == affil]
+    stations = stations.reset_index(drop=True)
+    sid = st.session_state.station_id
+    view = load_station(sid, stations_all.set_index("station_id").loc[sid])
+
+    render_kpis(view, gmsl, gmsl_meta)
+
+    map_col, panel_col = st.columns([2.2, 1], gap="large")
+    with map_col:
+        render_map(stations, theme, sid)
+    with panel_col:
+        render_station_panel(view)
+
+    h_col, p_col = st.columns(2, gap="large")
+    with h_col:
+        render_history(view, theme)
+    with p_col:
+        render_outlook(view, theme)
+
+    render_global(stations, gmsl, gmsl_meta, theme)
+    render_network_stats(stations, dataset)
+    render_methodology(gmsl_meta)
+    render_station_table(stations)
+
+    st.caption("Data: NOAA CO-OPS, PSMSL, CU Boulder Sea Level Research Group, NOAA Laboratory for "
+               "Satellite Altimetry. Altimetry data are provided by NOAA Laboratory for Satellite "
+               "Altimetry.")
+
+
+main()
