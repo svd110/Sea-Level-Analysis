@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import pandas as pd
 import requests
@@ -102,12 +102,29 @@ def _load_snapshot(name: str) -> tuple[Any, datetime]:
     return body["payload"], datetime.fromisoformat(body["saved_at"])
 
 
-def _with_snapshot(name: str, origin: str, fetch: Callable[[], Any]) -> Fetched:
+Provider = tuple[str, Callable[[], Any]]  # (human-readable origin, fetch function)
+
+
+def fetch_live(providers: Sequence[Provider],
+               on_error: Callable[[str, SourceError], None] | None = None) -> Fetched:
+    """The first provider that responds; raises SourceError if none do."""
+    errors = []
+    for origin, fetch in providers:
+        try:
+            return Fetched(fetch(), _now(), "live", origin)
+        except SourceError as exc:
+            errors.append(f"{origin}: {exc}")
+            if on_error:
+                on_error(origin, exc)
+    raise SourceError("; ".join(errors) or "no providers")
+
+
+def _with_snapshot(name: str, providers: Sequence[Provider]) -> Fetched:
     try:
-        return Fetched(fetch(), _now(), "live", origin)
+        return fetch_live(providers)
     except SourceError:
         payload, saved_at = _load_snapshot(name)
-        return Fetched(payload, saved_at, "snapshot", origin)
+        return Fetched(payload, saved_at, "snapshot", providers[0][0])
 
 
 # --- Station trends ---------------------------------------------------------
@@ -123,8 +140,8 @@ def fetch_trend_records(affil: str) -> list[dict]:
 
 def load_trends(affil: str) -> Fetched:
     return _with_snapshot(
-        f"trends_{affil.lower()}", "NOAA CO-OPS Sea Level Trends",
-        lambda: fetch_trend_records(affil),
+        f"trends_{affil.lower()}",
+        [("NOAA CO-OPS Sea Level Trends", lambda: fetch_trend_records(affil))],
     )
 
 
@@ -178,16 +195,21 @@ def fetch_projection_records(station_id: str, lat: float, lon: float) -> tuple[l
 
 # --- Live water levels (US CO-OPS stations only) ----------------------------
 
-def fetch_latest_water_level(station_id: str) -> dict | None:
-    """Most recent 6-minute observation relative to station MSL, or None."""
+def _datagetter(station_id: str, product: str, **params: str) -> list[dict]:
+    """CO-OPS observations relative to station MSL, or [] if the request fails."""
     try:
         body = _get_json(DATAGETTER, {
-            "date": "latest", "station": station_id, "product": "water_level",
-            "datum": "MSL", "units": "metric", "time_zone": "gmt", "format": "json",
+            "station": station_id, "product": product, "datum": "MSL",
+            "units": "metric", "time_zone": "gmt", "format": "json", **params,
         })
     except SourceError:
-        return None
-    data = body.get("data")
+        return []
+    return body.get("data") or []
+
+
+def fetch_latest_water_level(station_id: str) -> dict | None:
+    """Most recent 6-minute observation relative to station MSL, or None."""
+    data = _datagetter(station_id, "water_level", date="latest")
     return data[0] if data else None
 
 
@@ -195,15 +217,8 @@ def fetch_recent_monthly_extremes(station_id: str, months: int = 12) -> list[dic
     """Monthly highest water level (and MSL) for the last ``months`` months."""
     end = _now()
     start = (pd.Timestamp(end) - pd.DateOffset(months=months)).to_pydatetime()
-    try:
-        body = _get_json(DATAGETTER, {
-            "begin_date": start.strftime("%Y%m%d"), "end_date": end.strftime("%Y%m%d"),
-            "station": station_id, "product": "monthly_mean", "datum": "MSL",
-            "units": "metric", "time_zone": "gmt", "format": "json",
-        })
-    except SourceError:
-        return []
-    return body.get("data") or []
+    return _datagetter(station_id, "monthly_mean",
+                       begin_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
 
 
 # --- Global mean sea level from satellite altimetry -------------------------
@@ -243,10 +258,4 @@ GMSL_PROVIDERS = (
 
 
 def load_gmsl() -> Fetched:
-    for origin, fetch in GMSL_PROVIDERS:
-        try:
-            return Fetched(fetch(), _now(), "live", origin)
-        except SourceError:
-            continue
-    payload, saved_at = _load_snapshot("gmsl")
-    return Fetched(payload, saved_at, "snapshot", GMSL_PROVIDERS[0][0])
+    return _with_snapshot("gmsl", GMSL_PROVIDERS)

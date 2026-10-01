@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from .theme import Theme, rgba
-from .transform import CORE_SCENARIOS, KEY_YEARS, SCENARIOS
+from .transform import CORE_SCENARIOS, KEY_YEARS, SCENARIOS, to_cm
 
 FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 TREND_RANGE = 8  # mm/yr; map colours saturate beyond +/- this
@@ -34,12 +34,23 @@ def _base_layout(theme: Theme, height: int, **extra) -> dict:
     return layout
 
 
+def _band(fig: go.Figure, x, low, high, color: str, theme: Theme, name: str) -> None:
+    """Shaded range between ``low`` and ``high`` (an invisible upper edge, then fill)."""
+    fig.add_trace(go.Scatter(x=x, y=high, mode="lines", line=dict(width=0),
+                             hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(
+        x=x, y=low, mode="lines", line=dict(width=0), fill="tonexty",
+        fillcolor=rgba(color, theme.band_alpha), name=name, hoverinfo="skip",
+    ))
+
+
 # --- Map ---------------------------------------------------------------------
 
 def station_map(stations: pd.DataFrame, theme: Theme, selected_id: str | None) -> go.Figure:
     n = len(theme.diverging) - 1
     colorscale = [[i / n, c] for i, c in enumerate(theme.diverging)]
     period = [f"{int(s)}–{int(e)}" for s, e in zip(stations["start_year"], stations["end_year"])]
+    half = TREND_RANGE // 2
     custom = np.stack([
         stations["station_id"], stations["name"], stations["trend_mm_yr"],
         stations["trend_ci_mm_yr"], period, stations["direction"],
@@ -62,7 +73,8 @@ def station_map(stations: pd.DataFrame, theme: Theme, selected_id: str | None) -
             colorscale=colorscale, cmin=-TREND_RANGE, cmax=TREND_RANGE,
             colorbar=dict(
                 title=dict(text="Trend<br>mm/yr", font=dict(color=theme.ink_secondary, size=11)),
-                tickvals=[-8, -4, 0, 4, 8], ticktext=["≤ −8", "−4", "0", "+4", "≥ +8"],
+                tickvals=[-TREND_RANGE, -half, 0, half, TREND_RANGE],
+                ticktext=[f"≤ −{TREND_RANGE}", f"−{half}", "0", f"+{half}", f"≥ +{TREND_RANGE}"],
                 tickfont=dict(color=theme.ink_muted, size=11),
                 thickness=10, len=0.6, x=0.99, xanchor="right", bgcolor=rgba(theme.surface, 0.85),
                 outlinewidth=0,
@@ -79,12 +91,11 @@ def station_map(stations: pd.DataFrame, theme: Theme, selected_id: str | None) -
         showlegend=False,
     ))
     fig.update_layout(
-        **_base_layout(theme, 520),
+        **_base_layout(theme, 520, margin=dict(l=0, r=0, t=0, b=0)),
         map=dict(style=theme.map_style, center=dict(lat=22, lon=10), zoom=0.55),
         uirevision="station-map",  # keep the user's pan/zoom across reruns
         clickmode="event+select",
     )
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
     return fig
 
 
@@ -95,20 +106,20 @@ def station_history(monthly: pd.DataFrame, annual: pd.DataFrame, offset_m: float
     fig = go.Figure()
     obs = monthly.dropna(subset=["msl_m"])
     fig.add_trace(go.Scatter(
-        x=obs["date"], y=(obs["msl_m"] - offset_m) * 100, name="Monthly mean",
+        x=obs["date"], y=to_cm(obs["msl_m"], offset_m), name="Monthly mean",
         mode="lines", line=dict(color=theme.series_soft, width=1),
         hovertemplate="%{x|%b %Y}: %{y:+.1f} cm<extra>Monthly</extra>",
     ))
     fig.add_trace(go.Scatter(
         x=pd.to_datetime(annual["year"].astype(str) + "-07-01"),
-        y=(annual["msl_m"] - offset_m) * 100, name="Annual mean",
+        y=to_cm(annual["msl_m"], offset_m), name="Annual mean",
         mode="lines", line=dict(color=theme.series, width=2),
         hovertemplate="%{x|%Y}: %{y:+.1f} cm<extra>Annual</extra>",
     ))
     trend = monthly.dropna(subset=["trend_m"])
     if len(trend):
         fig.add_trace(go.Scatter(
-            x=trend["date"], y=(trend["trend_m"] - offset_m) * 100, name="Linear trend (NOAA)",
+            x=trend["date"], y=to_cm(trend["trend_m"], offset_m), name="Linear trend (NOAA)",
             mode="lines", line=dict(color=theme.reference, width=1.5, dash="dash"),
             hoverinfo="skip",
         ))
@@ -139,13 +150,8 @@ def station_projection(proj: pd.DataFrame | None, extrap: pd.DataFrame | None,
         wide = proj.pivot(index="year", columns="scenario", values="rsl_cm")
         years = wide.index
         if not show_all:
-            fig.add_trace(go.Scatter(x=years, y=wide["High"], mode="lines",
-                                     line=dict(width=0), hoverinfo="skip", showlegend=False))
-            fig.add_trace(go.Scatter(
-                x=years, y=wide["Low"], mode="lines", line=dict(width=0), fill="tonexty",
-                fillcolor=rgba(_scenario_color(theme, "Intermediate"), theme.band_alpha),
-                name="Low–High range", hoverinfo="skip",
-            ))
+            _band(fig, years, wide["Low"], wide["High"], _scenario_color(theme, "Intermediate"),
+                  theme, "Low–High range")
         for scenario in (SCENARIOS if show_all else CORE_SCENARIOS):
             core = scenario == "Intermediate"
             fig.add_trace(go.Scatter(
@@ -162,13 +168,8 @@ def station_projection(proj: pd.DataFrame | None, extrap: pd.DataFrame | None,
 
     elif extrap is not None and len(extrap):
         color = _scenario_color(theme, "Intermediate")
-        fig.add_trace(go.Scatter(x=extrap["year"], y=extrap["high_cm"], mode="lines",
-                                 line=dict(width=0), hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(
-            x=extrap["year"], y=extrap["low_cm"], mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor=rgba(color, theme.band_alpha),
-            name="95% range of trend", hoverinfo="skip",
-        ))
+        _band(fig, extrap["year"], extrap["low_cm"], extrap["high_cm"], color, theme,
+              "95% range of trend")
         fig.add_trace(go.Scatter(
             x=extrap["year"], y=extrap["rsl_cm"], name="Trend continued",
             mode="lines", line=dict(color=color, width=2.5, dash="dash"),
@@ -182,11 +183,11 @@ def station_projection(proj: pd.DataFrame | None, extrap: pd.DataFrame | None,
             hovertemplate="Observed %{x}: %{y:+.1f} cm<extra></extra>",
         ))
 
-    fig.update_layout(**_base_layout(theme, 320, hovermode="x unified"))
     # Leave room for the longest end label (~6.5 px per character at 11 px).
     labels = [f"{scenario} {y:+.0f}" for scenario, y in end_labels]
     right = round(6.5 * max(map(len, labels))) + 16 if labels else 12
-    fig.update_layout(margin=dict(l=64, r=right, t=40, b=48))
+    fig.update_layout(**_base_layout(theme, 320, hovermode="x unified",
+                                     margin=dict(l=64, r=right, t=40, b=48)))
     fig.update_yaxes(title_text=y_title)
     fig.update_xaxes(range=[1990, 2102], dtick=20)
     fig.add_hline(y=0, line=dict(color=theme.axis, width=1))
@@ -240,8 +241,8 @@ def region_bars(summary: pd.DataFrame, theme: Theme) -> go.Figure:
             "<extra></extra>"
         ),
     ))
-    fig.update_layout(**_base_layout(theme, GLOBAL_HEIGHT, bargap=0.35))
-    fig.update_layout(margin=dict(l=8, r=16, t=8, b=56))
+    fig.update_layout(**_base_layout(theme, GLOBAL_HEIGHT, bargap=0.35,
+                                     margin=dict(l=8, r=16, t=8, b=56)))
     fig.update_xaxes(title_text="Median relative sea-level trend (mm/yr)")
     fig.update_yaxes(gridcolor="rgba(0,0,0,0)", automargin=True)
     fig.add_vline(x=0, line=dict(color=theme.axis, width=1))

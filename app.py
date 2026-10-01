@@ -8,6 +8,7 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -38,14 +39,14 @@ def load_network() -> tuple[pd.DataFrame, list[sources.Fetched]]:
     us, gl = sources.load_trends("US"), sources.load_trends("Global")
     table = T.build_station_table(us.data, gl.data)
     # Drop the payloads from the metadata we keep around.
-    meta = [sources.Fetched(None, f.fetched_at, f.source, f.origin) for f in (us, gl)]
+    meta = [replace(f, data=None) for f in (us, gl)]
     return table, meta
 
 
 @st.cache_data(ttl=NETWORK_TTL, show_spinner="Loading satellite sea-level record…")
 def load_gmsl() -> tuple[pd.DataFrame, sources.Fetched]:
     f = sources.load_gmsl()
-    return T.parse_gmsl(f.data), sources.Fetched(None, f.fetched_at, f.source, f.origin)
+    return T.parse_gmsl(f.data), replace(f, data=None)
 
 
 @st.cache_data(ttl=NETWORK_TTL, show_spinner=False)
@@ -92,6 +93,13 @@ st.markdown(f"""
 .slr-station-name {{ font-size:1.3rem; font-weight:650; margin:0; }}
 </style>
 """, unsafe_allow_html=True)
+
+
+def metric(col, label, value, note=None, **kwargs):
+    """A bordered KPI card; ``note`` is shown as a neutral caption under the value."""
+    if note is not None:
+        kwargs.update(delta=note, delta_color="off", delta_arrow="off")
+    return col.metric(label, value, border=True, **kwargs)
 
 
 def plot(fig, **kwargs):
@@ -220,10 +228,9 @@ latest, extreme, live_at = load_live(sid) if is_us else (None, None, None)
 k1, k2, k3, k4 = st.columns(4)
 if gmsl is not None:
     gt = T.global_trend(gmsl)
-    k1.metric(
-        "Global trend (satellites)", f"{gt.rate_mm_yr:+.1f} mm/yr",
-        delta=f"{gt.recent_rate_mm_yr:+.1f} mm/yr over the last decade",
-        delta_color="off", delta_arrow="off", border=True,
+    metric(
+        k1, "Global trend (satellites)", f"{gt.rate_mm_yr:+.1f} mm/yr",
+        f"{gt.recent_rate_mm_yr:+.1f} mm/yr over the last decade",
         chart_data=gmsl.groupby(gmsl["year"].astype(int))["gmsl_mm"].mean().round(1).tolist(),
         chart_type="area",
         help=(f"Global mean sea level from satellite altimetry, {gt.start_year + 1}–"
@@ -231,37 +238,33 @@ if gmsl is not None:
               f"{gt.acceleration_mm_yr2:.2f} mm/yr each year. Source: {gmsl_meta.origin}."),
     )
 else:
-    k1.metric("Global trend (satellites)", "—", border=True, help="Satellite record unavailable.")
+    metric(k1, "Global trend (satellites)", "—", help="Satellite record unavailable.")
 
-k2.metric(
-    "Selected station trend", f"{station['trend_mm_yr']:+.2f} mm/yr",
-    delta=f"± {station['trend_ci_mm_yr']:.2f} mm/yr (95% confidence)", delta_color="off", delta_arrow="off",
-    border=True,
+metric(
+    k2, "Selected station trend", f"{station['trend_mm_yr']:+.2f} mm/yr",
+    f"± {station['trend_ci_mm_yr']:.2f} mm/yr (95% confidence)",
     help=("Long-term relative sea-level trend: includes both ocean rise and vertical "
           "land motion (sinking land adds to it, rising land subtracts)."),
 )
 arrow = {"Rising": "↑", "Falling": "↓"}.get(station["direction"], "→")
-k3.metric(
-    "Trend direction", f"{arrow} {station['direction']}", delta=station["name"],
-    delta_color="off", delta_arrow="off", border=True,
+metric(
+    k3, "Trend direction", f"{arrow} {station['direction']}", station["name"],
     help="Rising/falling only when the 95% confidence interval excludes zero.",
 )
 if has_proj:
-    p50 = T.projection_at(proj, 2050, "Intermediate")
-    lo, hi = T.projection_at(proj, 2050, "Low"), T.projection_at(proj, 2050, "High")
-    k4.metric("Projection 2050 (Intermediate)", f"{p50:+.0f} cm",
-              delta=f"Low–High range: {lo:+.0f} to {hi:+.0f} cm", delta_color="off", delta_arrow="off", border=True,
-              help="NOAA 2022 Interagency scenarios, relative to the 2000 baseline "
-                   "(1991–2009 average).")
+    lo, mid, hi = T.scenario_range(proj, 2050)
+    metric(k4, "Projection 2050 (Intermediate)", f"{mid:+.0f} cm",
+           f"Low–High range: {lo:+.0f} to {hi:+.0f} cm",
+           help="NOAA 2022 Interagency scenarios, relative to the 2000 baseline "
+                "(1991–2009 average).")
 elif extrap is not None:
     v = T.value_at(extrap, 2050)
-    k4.metric("2050 if the trend continues", f"{v:+.0f} cm", delta="Linear extrapolation only",
-              delta_color="off", delta_arrow="off", border=True,
-              help=f"Straight-line continuation of the observed trend, vs the {baseline_label}. "
-                   "NOAA scenarios cover US stations only; this ignores acceleration and "
-                   "likely understates future rise.")
+    metric(k4, "2050 if the trend continues", f"{v:+.0f} cm", "Linear extrapolation only",
+           help=f"Straight-line continuation of the observed trend, vs the {baseline_label}. "
+                "NOAA scenarios cover US stations only; this ignores acceleration and "
+                "likely understates future rise.")
 else:
-    k4.metric("Projection 2050", "—", border=True, help="No projection available.")
+    metric(k4, "Projection 2050", "—", help="No projection available.")
 
 # --- Map + station panel -----------------------------------------------------
 
@@ -300,19 +303,14 @@ with panel_col:
 
     st.markdown("**Projected rise**")
     if has_proj:
-        rows = []
-        for y in T.KEY_YEARS:
-            rows.append({
-                "Year": str(y),
-                "Intermediate": f"{T.projection_at(proj, y, 'Intermediate'):+.0f} cm",
-                "Low – High": f"{T.projection_at(proj, y, 'Low'):+.0f} to "
-                              f"{T.projection_at(proj, y, 'High'):+.0f} cm",
-            })
+        rows = [{"Year": str(y), "Intermediate": f"{mid:+.0f} cm",
+                 "Low – High": f"{lo:+.0f} to {hi:+.0f} cm"}
+                for y in T.KEY_YEARS for lo, mid, hi in [T.scenario_range(proj, y)]]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(f"NOAA 2022 scenarios ({proj_match}), relative to the 2000 baseline.")
     elif extrap is not None:
-        rows = [{"Year": str(y), "Trend continued": f"{T.value_at(extrap, y):+.0f} cm"}
-                for y in T.KEY_YEARS if T.value_at(extrap, y) is not None]
+        rows = [{"Year": str(y), "Trend continued": f"{v:+.0f} cm"}
+                for y in T.KEY_YEARS if (v := T.value_at(extrap, y)) is not None]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption("Linear extrapolation of the observed trend, vs the "
                    f"{baseline_label}. Not a climate projection.")
@@ -338,11 +336,7 @@ with p_col:
     show_all = has_proj and toggle.toggle(
         "Show all 5 scenarios", value=False,
         help="NOAA publishes five scenarios; the default view shows Low, Intermediate and High.")
-    observed = None
-    if has_monthly and len(annual):
-        observed = pd.DataFrame({"year": annual["year"],
-                                 "rsl_cm": (annual["msl_m"] - offset_m) * 100})
-        observed = observed[observed["year"] >= 1990]
+    observed = T.observed_annual(annual, offset_m) if has_monthly and len(annual) else None
     y_title = "cm vs 2000 baseline" if has_proj else f"cm vs {baseline_label}"
     if has_proj or extrap is not None:
         plot(charts.station_projection(proj if has_proj else None, extrap, observed,
@@ -389,14 +383,18 @@ with r_col:
 
 ns = T.network_stats(stations)
 s1, s2, s3, s4 = st.columns(4)  # height="stretch" keeps the cards level
-s1.metric("Monitored stations", f"{ns.stations}", border=True, height="stretch",
-          help=f"Tide gauges with a long-term NOAA trend ({dataset.lower()}).")
-s2.metric("↑ Significantly rising", f"{ns.rising}", f"{ns.rising / ns.stations:.0%} of stations",
-          delta_color="off", delta_arrow="off", border=True, height="stretch")
-s3.metric("↓ Significantly falling", f"{ns.falling}", f"{ns.falling / ns.stations:.0%} of stations",
-          delta_color="off", delta_arrow="off", border=True, height="stretch")
-s4.metric("Median station trend", f"{ns.median_trend:+.2f} mm/yr", border=True, height="stretch",
-          help="Relative trends at gauges, so it differs from the satellite global mean.")
+
+
+def share(n: int) -> str | None:
+    return f"{n / ns.stations:.0%} of stations" if ns.stations else None
+
+
+metric(s1, "Monitored stations", f"{ns.stations}", height="stretch",
+       help=f"Tide gauges with a long-term NOAA trend ({dataset.lower()}).")
+metric(s2, "↑ Significantly rising", f"{ns.rising}", share(ns.rising), height="stretch")
+metric(s3, "↓ Significantly falling", f"{ns.falling}", share(ns.falling), height="stretch")
+metric(s4, "Median station trend", f"{ns.median_trend:+.2f} mm/yr", height="stretch",
+       help="Relative trends at gauges, so it differs from the satellite global mean.")
 
 # --- Methods and data --------------------------------------------------------
 

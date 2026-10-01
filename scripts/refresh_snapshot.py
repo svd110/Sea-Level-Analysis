@@ -19,16 +19,16 @@ def main() -> None:
         records = sources.fetch_trend_records(affil)
         sources.save_snapshot(f"trends_{affil.lower()}", records)
         print(f"trends_{affil.lower()}: {len(records)} stations")
-    for origin, fetch in sources.GMSL_PROVIDERS:
-        try:
-            rows = fetch()
-        except sources.SourceError as exc:
-            print(f"gmsl: {origin} failed ({exc}), trying next provider")
-            continue
-        sources.save_snapshot("gmsl", rows)
-        print(f"gmsl: {len(rows)} rows from {origin}")
-        break
+    def report(origin: str, exc: sources.SourceError) -> None:
+        print(f"gmsl: {origin} failed ({exc}), trying next provider")
 
+    try:
+        gmsl = sources.fetch_live(sources.GMSL_PROVIDERS, on_error=report)
+    except sources.SourceError:
+        print("gmsl: every provider failed; snapshot left unchanged")
+        return
+    sources.save_snapshot("gmsl", gmsl.data)
+    print(f"gmsl: {len(gmsl.data)} rows from {gmsl.origin}")
 
 if __name__ == "__main__":
     main()

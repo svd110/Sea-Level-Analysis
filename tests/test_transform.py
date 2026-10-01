@@ -130,6 +130,8 @@ def test_parse_projections_orders_scenarios_and_caps_at_2100():
     assert list(df.loc[df["year"] == 2050, "scenario"]) == ["Low", "Intermediate", "High"]
     assert T.projection_at(df, 2050, "Intermediate") == 30
     assert T.projection_at(df, 2030, "Intermediate") is None
+    assert T.scenario_range(df, 2050) == (20, 30, 40)
+    assert T.scenario_range(df, 2030) == (None, None, None)
 
 
 def test_trend_anchor_and_extrapolation():
@@ -144,6 +146,13 @@ def test_trend_anchor_and_extrapolation():
     assert T.value_at(ex, 2100) == pytest.approx(cm + 0.4 * 91)
     assert (ex["low_cm"] <= ex["rsl_cm"]).all() and (ex["rsl_cm"] <= ex["high_cm"]).all()
     assert T.value_at(ex, 1990) is None
+
+
+def test_observed_annual_is_in_cm_on_the_baseline():
+    annual = pd.DataFrame({"year": [1985, 1995, 2005], "msl_m": [0.10, 0.12, 0.15]})
+    obs = T.observed_annual(annual, offset_m=0.12)
+    assert list(obs["year"]) == [1995, 2005]
+    assert obs["rsl_cm"].tolist() == pytest.approx([0.0, 3.0])
 
 
 # --- global mean sea level ---------------------------------------------------

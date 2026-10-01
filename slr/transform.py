@@ -65,11 +65,10 @@ def parse_trends(records: list[dict]) -> pd.DataFrame:
         if r.get("trend") is None or r.get("latitude") is None:
             continue
         affil = r.get("affil") or ""
-        name = (r.get("stationName") or r["stationId"]).strip()
-        name = DISPLAY_NAMES.get(str(r["stationId"]), name)
+        station_id = str(r["stationId"])
+        name = DISPLAY_NAMES.get(station_id, (r.get("stationName") or station_id).strip())
         place, country = _split_country(name, affil)
         lat, lon = float(r["latitude"]), float(r["longitude"])
-        station_id = str(r["stationId"])
         label = name if (affil != "US" or "," in name) else f"{name}, USA"
         rows.append({
             "station_id": station_id,
@@ -167,6 +166,11 @@ def baseline_offset(monthly: pd.DataFrame) -> tuple[float, str]:
     return float(obs["msl_m"].mean()), f"{first}–{last} record average"
 
 
+def to_cm(msl_m, offset_m: float):
+    """Metres relative to station MSL -> cm relative to the baseline."""
+    return (msl_m - offset_m) * 100
+
+
 def annual_means(monthly: pd.DataFrame, min_months: int = 10) -> pd.DataFrame:
     """Calendar-year means, keeping only years with enough months observed."""
     obs = monthly.dropna(subset=["msl_m"])
@@ -174,6 +178,12 @@ def annual_means(monthly: pd.DataFrame, min_months: int = 10) -> pd.DataFrame:
     out = pd.DataFrame({"msl_m": g.mean(), "months": g.size()})
     out = out[out["months"] >= min_months]
     return out.reset_index(names="year")
+
+
+def observed_annual(annual: pd.DataFrame, offset_m: float, since: int = 1990) -> pd.DataFrame:
+    """Annual means in cm on the baseline, for overlaying on projections."""
+    out = pd.DataFrame({"year": annual["year"], "rsl_cm": to_cm(annual["msl_m"], offset_m)})
+    return out[out["year"] >= since]
 
 
 @dataclass
@@ -244,7 +254,7 @@ def trend_anchor(annual: pd.DataFrame, offset_m: float, trend_mm_yr: float) -> t
     means, which is exactly where an OLS fit with that slope would put it.
     """
     years = annual["year"].to_numpy(dtype=float)
-    cm = (annual["msl_m"].to_numpy() - offset_m) * 100
+    cm = to_cm(annual["msl_m"].to_numpy(), offset_m)
     last = int(years.max())
     return last, float(cm.mean() + trend_mm_yr * (last - years.mean()) / 10)
 
@@ -278,6 +288,11 @@ def projection_at(proj: pd.DataFrame, year: int, scenario: str | None = None) ->
     if scenario is not None:
         rows = rows[rows["scenario"] == scenario]
     return float(rows["rsl_cm"].iloc[0]) if len(rows) else None
+
+
+def scenario_range(proj: pd.DataFrame, year: int) -> tuple[float | None, float | None, float | None]:
+    """(Low, Intermediate, High) projections at ``year``."""
+    return tuple(projection_at(proj, year, s) for s in ("Low", "Intermediate", "High"))
 
 
 # --- Global mean sea level ---------------------------------------------------
